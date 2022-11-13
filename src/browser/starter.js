@@ -188,6 +188,7 @@ function V86Starter(options)
                         try
                         {
                             const { instance } = await WebAssembly.instantiate(bytes, env);
+                            this.wasm_source = bytes;
                             resolve(instance.exports);
                         }
                         catch(err)
@@ -195,6 +196,7 @@ function V86Starter(options)
                             v86util.load_file(v86_bin_fallback, {
                                     done: async bytes => {
                                         const { instance } = await WebAssembly.instantiate(bytes, env);
+                                        this.wasm_source = bytes;
                                         resolve(instance.exports);
                                     },
                                 });
@@ -365,7 +367,7 @@ V86Starter.prototype.continue_init = async function(emulator, options)
 
     var files_to_load = [];
 
-    function add_file(name, file)
+    const add_file = (name, file) =>
     {
         if(!file)
         {
@@ -437,7 +439,7 @@ V86Starter.prototype.continue_init = async function(emulator, options)
 
                 if(file.use_parts)
                 {
-                    buffer = new v86util.AsyncXHRPartfileBuffer(file.url, file.size, file.fixed_chunk_size);
+                    buffer = new v86util.AsyncXHRPartfileBuffer(file.url, file.size, file.fixed_chunk_size, false, this.zstd_decompress.bind(this));
                 }
                 else
                 {
@@ -462,7 +464,7 @@ V86Starter.prototype.continue_init = async function(emulator, options)
         {
             dbg_log("Ignored file: url=" + file.url + " buffer=" + file.buffer);
         }
-    }
+    };
 
     if(options["state"])
     {
@@ -645,6 +647,99 @@ V86Starter.prototype.continue_init = async function(emulator, options)
 
             this.emulator_bus.send("emulator-loaded");
         }
+    }
+};
+
+V86Starter.prototype.zstd_decompress = async function(dst, src)
+{
+    if(false)
+    {
+        // decompress in synchronously in current process
+        const cpu = this.v86.cpu;
+
+        if(!this.zstd_context)
+        {
+            this.zstd_context = cpu.zstd_create_ctx(src.length);
+        }
+
+        new Uint8Array(cpu.wasm_memory.buffer, cpu.zstd_get_src_ptr(this.zstd_context), src.length).set(src);
+
+        const ptr = cpu.zstd_read(this.zstd_context, dst.length);
+        dst.set(new Uint8Array(cpu.wasm_memory.buffer, ptr, dst.length));
+        cpu.zstd_read_free(ptr, dst.length);
+
+        cpu.zstd_free_ctx(this.zstd_context);
+        this.zstd_context = null;
+    }
+    else
+    {
+        if(!this.zstd_worker)
+        {
+            function the_worker()
+            {
+                let wasm;
+
+                globalThis.onmessage = function(e)
+                {
+                    if(!wasm)
+                    {
+                        const env = Object.fromEntries([
+                            "cpu_exception_hook", "hlt_op",
+                            "abort",
+                            "microtick", "get_rand_int", "pic_acknowledge",
+                            "io_port_read8", "io_port_read16", "io_port_read32",
+                            "io_port_write8", "io_port_write16", "io_port_write32",
+                            "mmap_read8", "mmap_read16", "mmap_read32",
+                            "mmap_write8", "mmap_write16", "mmap_write32", "mmap_write64", "mmap_write128",
+                            "log_from_wasm",
+                            "console_log_from_wasm",
+                            "dbg_trace_from_wasm",
+                            "codegen_finalize",
+                            "jit_clear_func", "jit_clear_all_funcs",
+                        ].map(x => [x, () => console.log(x)]));
+                        env["__indirect_function_table"] = new WebAssembly.Table({ element: "anyfunc", "initial": 1024 });
+                        WebAssembly.instantiate(e.data, { "env": env }).then(w => {
+                            wasm = w;
+                            postMessage(0);
+                        });
+                        return;
+                    }
+
+                    const { size, src } = e.data;
+                    const exports = wasm.instance.exports;
+
+                    const dst = new Uint8Array(size);
+
+                    const zstd_context = exports["zstd_create_ctx"](src.length);
+                    new Uint8Array(exports.memory.buffer, exports["zstd_get_src_ptr"](zstd_context), src.length).set(src);
+
+                    const ptr = exports["zstd_read"](zstd_context, dst.length);
+                    dst.set(new Uint8Array(exports.memory.buffer, ptr, dst.length));
+                    exports["zstd_read_free"](ptr, dst.length);
+
+                    exports["zstd_free_ctx"](zstd_context);
+
+                    postMessage(dst, [dst.buffer]);
+                };
+            }
+
+            const url = URL.createObjectURL(new Blob(["(" + the_worker.toString() + ")()"], { type: "text/javascript" }));
+            this.zstd_worker = new Worker(url);
+            const done = new Promise(resolve => this.zstd_worker.onmessage = resolve);
+            this.zstd_worker.postMessage(this.wasm_source, [this.wasm_source]);
+            URL.revokeObjectURL(url);
+            await done;
+        }
+
+        return new Promise(resolve => {
+            this.zstd_worker.onmessage = function(e)
+            {
+                dbg_assert(dst.length === e.data.length);
+                dst.set(e.data);
+                resolve();
+            };
+            this.zstd_worker.postMessage({ src, size: dst.length }, [src.buffer]);
+        });
     }
 };
 
